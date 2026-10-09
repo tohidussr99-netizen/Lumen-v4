@@ -1,0 +1,921 @@
+name: Build Lumen APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Download AI model
+        run: |
+          mkdir -p app/src/main/assets mz
+          curl -fL -o mz/m.zip "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/real_esrgan_general_x4v3/releases/v0.62.2/real_esrgan_general_x4v3-tflite-float.zip"
+          unzip -o mz/m.zip -d mz/x
+          find mz/x -type f
+          cp "$(find mz/x -name '*.tflite' | head -1)" app/src/main/assets/sr.tflite
+          ls -la app/src/main/assets
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/pm17_hype/lumen
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Lumen"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          android.suppressUnsupportedCompileSdk=36
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.pm17_hype.lumen"
+              compileSdk = 36
+              defaultConfig {
+                  applicationId = "com.pm17_hype.lumen"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 4
+                  versionName = "4.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              val v = "1.5.0"
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.camera:camera-core:$v")
+              implementation("androidx.camera:camera-camera2:$v")
+              implementation("androidx.camera:camera-lifecycle:$v")
+              implementation("androidx.camera:camera-view:$v")
+              implementation("androidx.camera:camera-video:$v")
+              implementation("androidx.camera:camera-extensions:$v")
+              implementation("org.tensorflow:tensorflow-lite:2.16.1")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <application android:label="Lumen Camera" android:largeHeap="true"
+                  android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/pm17_hype/lumen/MainActivity.kt <<'EOF'
+          package com.pm17_hype.lumen
+
+          import android.Manifest
+          import android.content.ContentValues
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.Matrix
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CaptureRequest
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.ScaleGestureDetector
+          import android.view.View
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.camera.camera2.interop.Camera2CameraControl
+          import androidx.camera.camera2.interop.Camera2CameraInfo
+          import androidx.camera.camera2.interop.CaptureRequestOptions
+          import androidx.camera.core.*
+          import androidx.camera.core.resolutionselector.AspectRatioStrategy
+          import androidx.camera.core.resolutionselector.ResolutionSelector
+          import androidx.camera.extensions.ExtensionMode
+          import androidx.camera.extensions.ExtensionsManager
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.video.*
+          import androidx.camera.view.PreviewView
+          import androidx.core.content.ContextCompat
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.stream.IntStream
+          import kotlin.math.abs
+          import org.tensorflow.lite.DataType
+          import org.tensorflow.lite.Interpreter
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var pv: PreviewView
+              private lateinit var provider: ProcessCameraProvider
+              private lateinit var info: TextView
+              private lateinit var aiMsg: TextView
+              private lateinit var lensRow: LinearLayout
+              private lateinit var chips: LinearLayout
+              private lateinit var pro: LinearLayout
+              private lateinit var shutter: Button
+              private lateinit var zs: SeekBar
+              private var em: ExtensionsManager? = null
+              private var cam: Camera? = null
+              private var cap: ImageCapture? = null
+              private var vc: VideoCapture<Recorder>? = null
+              private var rec: Recording? = null
+              private var interp: Interpreter? = null
+              private var cis = listOf<CameraInfo>()
+              private var ids = listOf<String>()
+              private var labels = listOf<String>()
+              private var eqs = listOf<Float>()
+              private var rel = FloatArray(0)
+              private var idx = 0
+              private var zoomT = 1f
+              private var dz = 1f
+              private var autoLens = true
+              private var aiOn = false
+              private var lastSw = 0L
+              private var ext = ExtensionMode.NONE
+              private var kind = "photo"
+              private var flash = ImageCapture.FLASH_MODE_OFF
+              private var torch = false
+              private var preset = 1
+              private var busy = false
+              private var iso = 50
+              private var shut = 50
+              private var foc = 0
+              private var mAE = false
+              private var mAF = false
+              private var awbI = 0
+              private val awbV = intArrayOf(1, 5, 6, 2, 3)
+              private val awbN = arrayOf("Auto", "Daylight", "Cloudy", "Warm", "Fluor")
+              private val frames = intArrayOf(8, 16, 24)
+              private val presetN = arrayOf("Fast", "High", "Max")
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  buildUi()
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) init()
+                  else requestPermissions(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO), 1)
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, g: IntArray) {
+                  super.onRequestPermissionsResult(c, p, g)
+                  if (g.isNotEmpty() && g[0] == PackageManager.PERMISSION_GRANTED) init() else toast("Camera permission is needed")
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+              private fun st(s: String) = runOnUiThread { info.text = s }
+              private fun stamp() = "LUMEN_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+              private fun cv(n: String, mime: String, dir: String = "Pictures/Lumen") = ContentValues().apply {
+                  put(MediaStore.MediaColumns.DISPLAY_NAME, n)
+                  put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                  put(MediaStore.MediaColumns.RELATIVE_PATH, dir)
+              }
+
+              private fun LinearLayout.addB(t: String, f: (Button) -> Unit) {
+                  val b = Button(this@MainActivity).apply {
+                      text = t; isAllCaps = false; setTextColor(Color.WHITE); textSize = 13f
+                      setBackgroundColor(Color.argb(136, 0, 0, 0))
+                  }
+                  b.setOnClickListener { f(b) }
+                  addView(b, LinearLayout.LayoutParams(-2, -2).apply { setMargins(4, 4, 4, 4) })
+              }
+
+              private fun scroll(row: LinearLayout) = HorizontalScrollView(this).apply { addView(row) }
+
+              private fun seek(max: Int, f: (Int) -> Unit): SeekBar {
+                  val s = SeekBar(this)
+                  s.max = max
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sk: SeekBar?, p: Int, u: Boolean) { if (u) f(p) }
+                      override fun onStartTrackingTouch(sk: SeekBar?) {}
+                      override fun onStopTrackingTouch(sk: SeekBar?) {}
+                  })
+                  return s
+              }
+
+              private fun sb(parent: LinearLayout, name: String, f: (Int) -> Unit) {
+                  parent.addView(TextView(this).apply { setTextColor(Color.WHITE); textSize = 12f; text = name })
+                  parent.addView(seek(100) { f(it); applyPro() })
+              }
+
+              private fun buildUi() {
+                  pv = PreviewView(this)
+                  val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK); clipChildren = true }
+                  root.addView(pv, FrameLayout.LayoutParams(-1, -1))
+                  val sd = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      override fun onScale(d: ScaleGestureDetector): Boolean { zoomTo(zoomT * d.scaleFactor); return true }
+                  })
+                  pv.setOnTouchListener { _, e ->
+                      sd.onTouchEvent(e)
+                      if (e.action == MotionEvent.ACTION_UP && !sd.isInProgress) {
+                          val p = pv.meteringPointFactory.createPoint(e.x, e.y)
+                          cam?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(p).build())
+                      }
+                      true
+                  }
+                  val ui = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.BOTTOM; setPadding(16, 16, 16, 64) }
+                  info = TextView(this).apply { setTextColor(Color.WHITE); textSize = 13f; setPadding(8, 0, 0, 0) }
+                  lensRow = LinearLayout(this)
+                  chips = LinearLayout(this)
+                  listOf(0.6f, 1f, 2f, 3f, 5f, 10f, 30f, 100f, 200f).forEach { z ->
+                      chips.addB(z.toString().removeSuffix(".0") + "x") { zoomTo(z) }
+                  }
+                  zs = seek(1000) { zoomTo(0.5f * Math.pow(400.0, it / 1000.0).toFloat()) }
+                  pro = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; visibility = View.GONE
+                      setBackgroundColor(Color.argb(110, 0, 0, 0)); setPadding(12, 8, 12, 8)
+                  }
+                  sb(pro, "ISO") { iso = it; mAE = true }
+                  sb(pro, "Shutter speed") { shut = it; mAE = true }
+                  sb(pro, "Focus (left = far, right = close)") { foc = it; mAF = true }
+                  val pr = LinearLayout(this)
+                  pr.addB("WB: Auto") { b -> awbI = (awbI + 1) % 5; b.text = "WB: " + awbN[awbI]; applyPro() }
+                  pr.addB("Reset to Auto") {
+                      cam?.let { Camera2CameraControl.from(it.cameraControl).clearCaptureRequestOptions() }
+                      mAE = false; mAF = false; awbI = 0
+                  }
+                  pro.addView(pr)
+                  val modes = LinearLayout(this)
+                  modes.addB("Auto") { kind = "photo"; ext = ExtensionMode.NONE; bind() }
+                  modes.addB("AI Zoom") { kind = "ai"; bind() }
+                  modes.addB("HDR") { kind = "photo"; ext = ExtensionMode.HDR; bind() }
+                  modes.addB("Night") { kind = "night"; bind() }
+                  modes.addB("Portrait") { kind = "photo"; ext = ExtensionMode.BOKEH; bind() }
+                  modes.addB("Pro") { kind = "pro"; bind() }
+                  modes.addB("RAW") { kind = "raw"; bind() }
+                  modes.addB("Ultra") { kind = "ultra"; bind() }
+                  modes.addB("Video") { kind = "video"; bind() }
+                  val xr = LinearLayout(this)
+                  xr.addB("Flash: Off") { b ->
+                      flash = when (flash) {
+                          ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_AUTO
+                          ImageCapture.FLASH_MODE_AUTO -> ImageCapture.FLASH_MODE_ON
+                          else -> ImageCapture.FLASH_MODE_OFF
+                      }
+                      b.text = "Flash: " + listOf("Auto", "On", "Off")[flash]
+                  }
+                  xr.addB("Torch") { torch = !torch; cam?.cameraControl?.enableTorch(torch) }
+                  xr.addB("Ultra: High") { b -> preset = (preset + 1) % 3; b.text = "Ultra: " + presetN[preset] }
+                  xr.addB("Auto lens: On") { b -> autoLens = !autoLens; b.text = "Auto lens: " + (if (autoLens) "On" else "Off") }
+                  xr.addB("AI + Ultra/Night: Off") { b -> aiOn = !aiOn; b.text = "AI + Ultra/Night: " + (if (aiOn) "On" else "Off") }
+                  shutter = Button(this).apply { text = "●"; textSize = 30f; setOnClickListener { shoot() } }
+                  ui.addView(info)
+                  ui.addView(scroll(lensRow))
+                  ui.addView(zs)
+                  ui.addView(scroll(chips))
+                  ui.addView(pro)
+                  ui.addView(scroll(modes))
+                  ui.addView(scroll(xr))
+                  ui.addView(shutter, LinearLayout.LayoutParams(220, 220).apply { gravity = Gravity.CENTER_HORIZONTAL })
+                  root.addView(ui, FrameLayout.LayoutParams(-1, -1))
+                  aiMsg = TextView(this).apply {
+                      setTextColor(Color.WHITE); textSize = 20f; setBackgroundColor(Color.argb(170, 0, 0, 0))
+                      setPadding(40, 28, 40, 28); text = "AI is improving photo..."; visibility = View.GONE
+                  }
+                  root.addView(aiMsg, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+                  setContentView(root)
+              }
+
+              private fun init() {
+                  val f = ProcessCameraProvider.getInstance(this)
+                  f.addListener({
+                      provider = f.get()
+                      val ef = ExtensionsManager.getInstanceAsync(this, provider)
+                      ef.addListener({
+                          em = ef.get()
+                          lenses()
+                          bind()
+                      }, ContextCompat.getMainExecutor(this))
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun lenses() {
+                  cis = provider.availableCameraInfos
+                  ids = cis.map { Camera2CameraInfo.from(it).cameraId }
+                  eqs = cis.map { ci ->
+                      val c2 = Camera2CameraInfo.from(ci)
+                      val f = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+                      val s = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                      if (f != null && s != null) (f * 43.27 / Math.hypot(s.width.toDouble(), s.height.toDouble())).toFloat() else 0f
+                  }
+                  labels = cis.mapIndexed { i, ci ->
+                      val c2 = Camera2CameraInfo.from(ci)
+                      val face = if (c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT) "Front" else "Back"
+                      face + " ID" + c2.cameraId + (if (eqs[i] > 0f) " " + Math.round(eqs[i]) + "mm" else "")
+                  }
+                  val backs = labels.indices.filter { labels[it].startsWith("Back") && eqs[it] > 0f }
+                  val mainI = backs.minByOrNull { abs(eqs[it] - 24f) } ?: labels.indexOfFirst { it.startsWith("Back") }.coerceAtLeast(0)
+                  val me = eqs.getOrElse(mainI) { 0f }
+                  rel = FloatArray(labels.size) { if (eqs[it] > 0f && me > 0f) eqs[it] / me else 1f }
+                  idx = mainI
+                  zoomT = 1f
+                  lensRow.removeAllViews()
+                  labels.forEachIndexed { i, t -> lensRow.addB(t) { idx = i; zoomT = rel[i]; bind() } }
+                  if (labels.isEmpty()) toast("No cameras found")
+              }
+
+              private fun bind() {
+                  if (ids.isEmpty()) return
+                  rec?.stop(); rec = null
+                  val cid = ids[idx]
+                  var sel = CameraSelector.Builder()
+                      .addCameraFilter(CameraFilter { l -> l.filter { Camera2CameraInfo.from(it).cameraId == cid } })
+                      .build()
+                  var m = if (kind == "photo") ext else ExtensionMode.NONE
+                  val e = em
+                  if (m != ExtensionMode.NONE && e != null) {
+                      if (e.isExtensionAvailable(sel, m)) sel = e.getExtensionEnabledCameraSelector(sel, m)
+                      else { toast("This mode is not available on this lens"); ext = ExtensionMode.NONE; m = ExtensionMode.NONE }
+                  }
+                  if (kind == "raw" && !ImageCapture.getImageCaptureCapabilities(cis[idx]).supportedOutputFormats.contains(ImageCapture.OUTPUT_FORMAT_RAW)) {
+                      toast("RAW is not supported on this lens. Try the main lens."); kind = "photo"
+                  }
+                  val prev = Preview.Builder().build().also { it.setSurfaceProvider(pv.surfaceProvider) }
+                  pro.visibility = if (kind == "pro") View.VISIBLE else View.GONE
+                  torch = false; cap = null; vc = null; mAE = false; mAF = false; awbI = 0
+                  try {
+                      provider.unbindAll()
+                      if (kind == "video") {
+                          val rc = Recorder.Builder().setQualitySelector(QualitySelector.fromOrderedList(
+                              listOf(Quality.UHD, Quality.FHD, Quality.HD), FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))).build()
+                          val v = VideoCapture.withOutput(rc)
+                          cam = provider.bindToLifecycle(this, sel, prev, v)
+                          vc = v
+                      } else {
+                          val b = ImageCapture.Builder().setJpegQuality(100)
+                          if (kind == "ultra" || kind == "night" || kind == "ai") b.setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                          else b.setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                          if (kind == "raw") b.setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW)
+                          if ((kind == "photo" || kind == "pro") && m == ExtensionMode.NONE) b.setResolutionSelector(
+                              ResolutionSelector.Builder()
+                                  .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                                  .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+                                  .build())
+                          val ic = b.build()
+                          cam = provider.bindToLifecycle(this, sel, prev, ic)
+                          cap = ic
+                      }
+                      applyZoom()
+                  } catch (ex: Exception) {
+                      toast("Cannot open this lens or mode: " + ex.message)
+                  }
+              }
+
+              /* ---------- zoom: 0.5x to 200x, switches lens by itself ---------- */
+              private fun zoomTo(z: Float) {
+                  zoomT = z.coerceIn(0.5f, 200f)
+                  if (autoLens && rec == null && !busy && labels.isNotEmpty() && labels[idx].startsWith("Back")) {
+                      val backs = labels.indices.filter { labels[it].startsWith("Back") && eqs[it] > 0f }
+                      if (backs.isNotEmpty()) {
+                          val want = backs.filter { rel[it] <= zoomT * 1.02f }.maxByOrNull { rel[it] } ?: backs.minByOrNull { rel[it] }!!
+                          if (want != idx && System.currentTimeMillis() - lastSw > 1200) {
+                              idx = want; lastSw = System.currentTimeMillis(); bind(); return
+                          }
+                      }
+                  }
+                  applyZoom()
+              }
+
+              private fun applyZoom() {
+                  val c = cam
+                  val s = c?.cameraInfo?.zoomState?.value
+                  if (c != null && s != null) {
+                      val r = rel.getOrElse(idx) { 1f }
+                      val hw = (zoomT / r).coerceIn(s.minZoomRatio, s.maxZoomRatio)
+                      c.cameraControl.setZoomRatio(hw)
+                      dz = maxOf(1f, zoomT / (hw * r))
+                      pv.scaleX = dz
+                      pv.scaleY = dz
+                  }
+                  zs.progress = (1000 * Math.log(zoomT / 0.5) / Math.log(400.0)).toInt()
+                  info.text = labels.getOrElse(idx) { "" } + "  " + kind + "  " + String.format("%.1f", zoomT) + "x" + (if (dz > 1.01f) " (digital)" else "")
+              }
+
+              /* ---------- Pro controls (manual ISO, shutter, focus, white balance) ---------- */
+              private fun applyPro() {
+                  val c = cam ?: return
+                  val c2 = Camera2CameraInfo.from(c.cameraInfo)
+                  val b = CaptureRequestOptions.Builder()
+                  if (mAE) {
+                      val ir = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: return
+                      val tr = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: return
+                      val hi = minOf(tr.upper, 2000000000L)
+                      val ns = (tr.lower * Math.pow(hi.toDouble() / tr.lower, shut / 100.0)).toLong()
+                      b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, 0)
+                      b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, ir.lower + (ir.upper - ir.lower) * iso / 100)
+                      b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, ns)
+                  }
+                  if (mAF) {
+                      val mf = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                      b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, 0)
+                      b.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, mf * foc / 100f)
+                  }
+                  if (awbI != 0) b.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, awbV[awbI])
+                  Camera2CameraControl.from(c.cameraControl).setCaptureRequestOptions(b.build())
+              }
+
+              /* ---------- shutter ---------- */
+              private fun shoot() {
+                  when (kind) {
+                      "video" -> toggleVideo()
+                      "ai" -> stack(8, false, true)
+                      "ultra" -> stack(frames[preset], false, aiOn)
+                      "night" -> stack(if (preset == 2) 24 else 16, true, aiOn)
+                      "raw" -> save(".dng", "image/x-adobe-dng")
+                      else -> save(".jpg", "image/jpeg")
+                  }
+              }
+
+              private fun save(ext: String, mime: String) {
+                  val c = cap ?: return
+                  c.flashMode = flash
+                  if (ext == ".jpg" && dz > 1.02f) { cropSave(c); return }
+                  val o = ImageCapture.OutputFileOptions.Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv(stamp() + ext, mime)).build()
+                  c.takePicture(o, ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageSavedCallback {
+                      override fun onImageSaved(r: ImageCapture.OutputFileResults) { toast("Saved to Gallery") }
+                      override fun onError(e: ImageCaptureException) { toast("Error: " + e.message) }
+                  })
+              }
+
+              /* digital zoom beyond the lens limit: crop the centre and scale up */
+              private fun cropSave(c: ImageCapture) {
+                  val z = dz
+                  c.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
+                      override fun onCaptureSuccess(im: ImageProxy) {
+                          val bf = im.planes[0].buffer
+                          val a = ByteArray(bf.remaining())
+                          bf.get(a)
+                          val rot = im.imageInfo.rotationDegrees
+                          im.close()
+                          Thread {
+                              try {
+                                  saveBmp(zoomCrop(BitmapFactory.decodeByteArray(a, 0, a.size), z), rot, "")
+                                  runOnUiThread { toast("Saved to Gallery (digital zoom)") }
+                              } catch (e: Throwable) { runOnUiThread { toast("Save failed: " + e.message) } }
+                          }.start()
+                      }
+                      override fun onError(e: ImageCaptureException) { toast("Error: " + e.message) }
+                  })
+              }
+
+              private fun cropOnly(bm: Bitmap, z: Float): Bitmap {
+                  if (z <= 1.02f) return bm
+                  val cw = (bm.width / z).toInt()
+                  val ch = (bm.height / z).toInt()
+                  return Bitmap.createBitmap(bm, (bm.width - cw) / 2, (bm.height - ch) / 2, cw, ch)
+              }
+
+              private fun zoomCrop(bm: Bitmap, z: Float): Bitmap {
+                  if (z <= 1.02f) return bm
+                  return Bitmap.createScaledBitmap(cropOnly(bm, z), bm.width, bm.height, true)
+              }
+
+              private fun rotateBmp(bm: Bitmap, rot: Int): Bitmap =
+                  if (rot != 0) Bitmap.createBitmap(bm, 0, 0, bm.width, bm.height, Matrix().apply { postRotate(rot.toFloat()) }, true) else bm
+
+              private fun saveBmp(bm: Bitmap, rot: Int, suffix: String) {
+                  val fin = rotateBmp(bm, rot)
+                  val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv(stamp() + suffix + ".jpg", "image/jpeg"))!!
+                  contentResolver.openOutputStream(uri)!!.use { fin.compress(Bitmap.CompressFormat.JPEG, 97, it) }
+              }
+
+              private fun toggleVideo() {
+                  val r = rec
+                  if (r != null) { r.stop(); return }
+                  val v = vc ?: return
+                  val o = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                      .setContentValues(cv(stamp() + ".mp4", "video/mp4", "Movies/Lumen")).build()
+                  var p = v.output.prepareRecording(this, o)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) p = p.withAudioEnabled()
+                  rec = p.start(ContextCompat.getMainExecutor(this)) { ev ->
+                      if (ev is VideoRecordEvent.Finalize) {
+                          rec = null; shutter.text = "●"
+                          toast(if (ev.hasError()) "Video error " + ev.error else "Video saved to Gallery")
+                      }
+                  }
+                  shutter.text = "■"
+              }
+
+              /* ---------- on-device AI super-resolution (Real-ESRGAN, 4x) ---------- */
+              private fun model(): Interpreter {
+                  interp?.let { return it }
+                  val bytes = assets.open("sr.tflite").readBytes()
+                  val bb = ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder())
+                  bb.put(bytes)
+                  bb.rewind()
+                  val ip = Interpreter(bb, Interpreter.Options().setNumThreads(4))
+                  interp = ip
+                  return ip
+              }
+
+              private fun sr(src: Bitmap, onP: (Int) -> Unit): Bitmap {
+                  val ip = model()
+                  if (ip.getInputTensor(0).dataType() != DataType.FLOAT32) throw RuntimeException("model is not float")
+                  val ish = ip.getInputTensor(0).shape()
+                  val osh = ip.getOutputTensor(0).shape()
+                  val nchw = ish[1] == 3
+                  val t = if (nchw) ish[2] else ish[1]
+                  val s = (if (nchw) osh[2] else osh[1]) / t
+                  val m = 16
+                  val core = t - 2 * m
+                  val w = src.width
+                  val h = src.height
+                  val px = IntArray(w * h)
+                  src.getPixels(px, 0, w, 0, 0, w, h)
+                  val ow = w * s
+                  val oh = h * s
+                  val out = IntArray(ow * oh)
+                  val inB = ByteBuffer.allocateDirect(4 * 3 * t * t).order(ByteOrder.nativeOrder())
+                  val outB = ByteBuffer.allocateDirect(4 * 3 * t * s * t * s).order(ByteOrder.nativeOrder())
+                  val f = FloatArray(3 * t * t)
+                  val o = FloatArray(3 * t * s * t * s)
+                  val os = t * s
+                  val nx = (w + core - 1) / core
+                  val ny = (h + core - 1) / core
+                  for (j in 0 until ny) for (i in 0 until nx) {
+                      val ox = i * core - m
+                      val oy = j * core - m
+                      for (y in 0 until t) for (x in 0 until t) {
+                          val p = px[(oy + y).coerceIn(0, h - 1) * w + (ox + x).coerceIn(0, w - 1)]
+                          val r = (p shr 16 and 255) / 255f
+                          val g = (p shr 8 and 255) / 255f
+                          val b = (p and 255) / 255f
+                          if (nchw) { f[y * t + x] = r; f[t * t + y * t + x] = g; f[2 * t * t + y * t + x] = b }
+                          else { val k = (y * t + x) * 3; f[k] = r; f[k + 1] = g; f[k + 2] = b }
+                      }
+                      inB.rewind()
+                      inB.asFloatBuffer().put(f)
+                      inB.rewind()
+                      outB.rewind()
+                      ip.run(inB, outB)
+                      outB.rewind()
+                      outB.asFloatBuffer().get(o)
+                      for (y in 0 until core * s) for (x in 0 until core * s) {
+                          val gx = i * core * s + x
+                          val gy = j * core * s + y
+                          if (gx >= ow || gy >= oh) continue
+                          val sx = m * s + x
+                          val sy = m * s + y
+                          val r: Float
+                          val g: Float
+                          val b: Float
+                          if (nchw) { r = o[sy * os + sx]; g = o[os * os + sy * os + sx]; b = o[2 * os * os + sy * os + sx] }
+                          else { val k = (sy * os + sx) * 3; r = o[k]; g = o[k + 1]; b = o[k + 2] }
+                          out[gy * ow + gx] = (0xFF shl 24) or (cl(r * 255f) shl 16) or (cl(g * 255f) shl 8) or cl(b * 255f)
+                      }
+                      onP(100 * (j * nx + i + 1) / (nx * ny))
+                  }
+                  val bm = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+                  bm.setPixels(out, 0, ow, 0, 0, ow, oh)
+                  return bm
+              }
+
+              /* src is already rotated and zoom-cropped */
+              private fun aiFinish(src: Bitmap) {
+                  runOnUiThread { aiMsg.text = "AI is improving photo..."; aiMsg.visibility = View.VISIBLE }
+                  try {
+                      val l = maxOf(src.width, src.height)
+                      val inp = if (l > 1024) Bitmap.createScaledBitmap(src, src.width * 1024 / l, src.height * 1024 / l, true) else src
+                      val big = sr(inp) { p -> runOnUiThread { aiMsg.text = "AI is improving photo... " + p + "%" } }
+                      val bl = maxOf(big.width, big.height)
+                      val fin = if (bl < 3000) {
+                          val k = 3000f / bl
+                          Bitmap.createScaledBitmap(big, (big.width * k).toInt(), (big.height * k).toInt(), true)
+                      } else big
+                      saveBmp(fin, 0, "_AI")
+                      runOnUiThread { aiMsg.visibility = View.GONE; showResult(src, fin); toast("AI photo saved to Gallery") }
+                  } catch (e: Throwable) {
+                      saveBmp(src, 0, "")
+                      runOnUiThread { aiMsg.visibility = View.GONE; toast("AI failed: " + e.message + ". Normal photo saved.") }
+                  }
+              }
+
+              private fun showResult(orig: Bitmap, imp: Bitmap) {
+                  val root = pv.parent as FrameLayout
+                  val iv = ImageView(this).apply { setImageBitmap(imp); scaleType = ImageView.ScaleType.FIT_CENTER }
+                  val lab = TextView(this).apply { text = "Improved (AI)"; setTextColor(Color.WHITE); textSize = 16f; setPadding(24, 64, 24, 8) }
+                  val ov = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                  ov.addView(iv, FrameLayout.LayoutParams(-1, -1))
+                  ov.addView(lab, FrameLayout.LayoutParams(-2, -2))
+                  val bar = LinearLayout(this)
+                  var showImp = true
+                  bar.addB("Original / Improved") {
+                      showImp = !showImp
+                      iv.setImageBitmap(if (showImp) imp else orig)
+                      lab.text = if (showImp) "Improved (AI)" else "Original"
+                  }
+                  bar.addB("Save original too") {
+                      Thread { saveBmp(orig, 0, "_orig"); runOnUiThread { toast("Original saved") } }.start()
+                  }
+                  bar.addB("Close") { root.removeView(ov) }
+                  ov.addView(scroll(bar), FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply { bottomMargin = 96 })
+                  root.addView(ov, FrameLayout.LayoutParams(-1, -1))
+              }
+
+              /* ---------- Ultra, Night and AI Zoom: many real frames, align, merge, enhance ---------- */
+              private fun stack(n: Int, night: Boolean, ai: Boolean) {
+                  if (busy) return
+                  val c = cap ?: return
+                  busy = true
+                  val ex = dz
+                  val jp = ArrayList<ByteArray>()
+                  var rot = 0
+                  val t0 = System.currentTimeMillis()
+                  if (night) cam?.let { it.cameraControl.setExposureCompensationIndex(it.cameraInfo.exposureState.exposureCompensationRange.upper) }
+                  toast("Hold still")
+                  fun next() {
+                      if (jp.size >= n) {
+                          if (night) cam?.cameraControl?.setExposureCompensationIndex(0)
+                          Thread {
+                              try { process(jp, rot, t0, night, ex, ai) }
+                              catch (e: Throwable) { runOnUiThread { toast("Failed: " + e.message) } }
+                              finally { busy = false }
+                          }.start()
+                          return
+                      }
+                      c.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
+                          override fun onCaptureSuccess(im: ImageProxy) {
+                              val bf = im.planes[0].buffer
+                              val a = ByteArray(bf.remaining())
+                              bf.get(a)
+                              rot = im.imageInfo.rotationDegrees
+                              im.close()
+                              jp.add(a)
+                              info.text = "Capturing " + jp.size + "/" + n
+                              next()
+                          }
+                          override fun onError(e: ImageCaptureException) {
+                              toast("Error: " + e.message); busy = false
+                              if (night) cam?.cameraControl?.setExposureCompensationIndex(0)
+                          }
+                      })
+                  }
+                  next()
+              }
+
+              private fun lum(p: Int) = ((p shr 16 and 255) * 299 + (p shr 8 and 255) * 587 + (p and 255) * 114) / 1000
+              private fun cl(v: Float) = v.coerceIn(0f, 255f).toInt()
+
+              private fun process(jp: List<ByteArray>, rot: Int, t0: Long, night: Boolean, ex: Float, ai: Boolean) {
+                  st("Scoring frames")
+                  val so = BitmapFactory.Options().apply { inSampleSize = 4 }
+                  var sw = 0
+                  var sh = 0
+                  val g = jp.map {
+                      val b = BitmapFactory.decodeByteArray(it, 0, it.size, so)
+                      sw = b.width; sh = b.height
+                      val px = IntArray(sw * sh)
+                      b.getPixels(px, 0, sw, 0, 0, sw, sh)
+                      b.recycle()
+                      ByteArray(px.size) { i -> lum(px[i]).toByte() }
+                  }
+                  val sc = g.map { lap(it, sw, sh) }
+                  val order = sc.indices.sortedByDescending { sc[it] }.take(maxOf(3, (jp.size * 3 + 3) / 4))
+                  val r0 = order[0]
+                  var bm = BitmapFactory.decodeByteArray(jp[r0], 0, jp[r0].size)
+                  val w = bm.width
+                  val h = bm.height
+                  val rp = IntArray(w * h)
+                  bm.getPixels(rp, 0, w, 0, 0, w, h)
+                  bm.recycle()
+                  val sum = ShortArray(w * h * 3)
+                  val cnt = ByteArray(w * h)
+                  acc(rp, rp, w, h, 0f, 0f, false, sum, cnt)
+                  var k = 1
+                  for (j in order.drop(1)) {
+                      k++
+                      st("Aligning and merging " + k + "/" + order.size)
+                      val co = est(g[r0], g[j], sw, sh, 8, 0, 0, 2)
+                      bm = BitmapFactory.decodeByteArray(jp[j], 0, jp[j].size)
+                      if (bm.width != w || bm.height != h) { bm.recycle(); continue }
+                      val cp = IntArray(w * h)
+                      bm.getPixels(cp, 0, w, 0, 0, w, h)
+                      bm.recycle()
+                      val f = fine(rp, cp, w, h, Math.round(co[0] * 4), Math.round(co[1] * 4))
+                      acc(rp, cp, w, h, f[0], f[1], true, sum, cnt)
+                  }
+                  st("Combining frames")
+                  IntStream.range(0, h).parallel().forEach { y ->
+                      for (x in 0 until w) {
+                          val o = y * w + x
+                          val c = cnt[o].toInt()
+                          if (c > 0) rp[o] = (0xFF shl 24) or ((sum[o * 3] / c) shl 16) or ((sum[o * 3 + 1] / c) shl 8) or (sum[o * 3 + 2] / c)
+                      }
+                  }
+                  st("Enhancing")
+                  enhance(rp, w, h, night)
+                  val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  out.setPixels(rp, 0, w, 0, 0, w, h)
+                  if (ai) {
+                      aiFinish(rotateBmp(cropOnly(out, ex), rot))
+                  } else {
+                      st("Saving")
+                      saveBmp(zoomCrop(out, ex), rot, "")
+                      val secs = (System.currentTimeMillis() - t0) / 1000
+                      runOnUiThread { toast((if (night) "Night" else "Ultra") + " photo saved to Gallery (" + secs + "s, " + order.size + " frames)") }
+                  }
+              }
+
+              private fun acc(rp: IntArray, cp: IntArray, w: Int, h: Int, dx: Float, dy: Float, ghost: Boolean, sum: ShortArray, cnt: ByteArray) {
+                  IntStream.range(0, h).parallel().forEach { y ->
+                      for (x in 0 until w) {
+                          val fx = x + dx
+                          val fy = y + dy
+                          val x0 = fx.toInt()
+                          val y0 = fy.toInt()
+                          if (fx < 0f || fy < 0f || x0 >= w - 1 || y0 >= h - 1) continue
+                          val tx = fx - x0
+                          val ty = fy - y0
+                          val i = y0 * w + x0
+                          val p00 = cp[i]
+                          val p10 = cp[i + 1]
+                          val p01 = cp[i + w]
+                          val p11 = cp[i + w + 1]
+                          val w00 = (1 - tx) * (1 - ty)
+                          val w10 = tx * (1 - ty)
+                          val w01 = (1 - tx) * ty
+                          val w11 = tx * ty
+                          val r = ((p00 shr 16 and 255) * w00 + (p10 shr 16 and 255) * w10 + (p01 shr 16 and 255) * w01 + (p11 shr 16 and 255) * w11).toInt()
+                          val gg = ((p00 shr 8 and 255) * w00 + (p10 shr 8 and 255) * w10 + (p01 shr 8 and 255) * w01 + (p11 shr 8 and 255) * w11).toInt()
+                          val b = ((p00 and 255) * w00 + (p10 and 255) * w10 + (p01 and 255) * w01 + (p11 and 255) * w11).toInt()
+                          val o = y * w + x
+                          if (ghost && abs((r * 299 + gg * 587 + b * 114) / 1000 - lum(rp[o])) > 40) continue
+                          sum[o * 3] = (sum[o * 3] + r).toShort()
+                          sum[o * 3 + 1] = (sum[o * 3 + 1] + gg).toShort()
+                          sum[o * 3 + 2] = (sum[o * 3 + 2] + b).toShort()
+                          cnt[o] = (cnt[o] + 1).toByte()
+                      }
+                  }
+              }
+
+              private fun lap(g: ByteArray, w: Int, h: Int): Double {
+                  var s = 0.0
+                  var s2 = 0.0
+                  var n = 0
+                  var y = 1
+                  while (y < h - 1) {
+                      var x = 1
+                      while (x < w - 1) {
+                          val i = y * w + x
+                          val v = 4 * (g[i].toInt() and 255) - (g[i - 1].toInt() and 255) - (g[i + 1].toInt() and 255) - (g[i - w].toInt() and 255) - (g[i + w].toInt() and 255)
+                          s += v; s2 += v.toDouble() * v; n++
+                          x += 2
+                      }
+                      y += 2
+                  }
+                  return s2 / n - (s / n) * (s / n)
+              }
+
+              private fun refine(sc: Array<DoubleArray>, R: Int, best: Double, bx: Int, by: Int, ox: Int, oy: Int): FloatArray {
+                  fun q(m: Double, p: Double): Double { val d = m - 2 * best + p; return if (d == 0.0) 0.0 else (0.5 * (m - p) / d).coerceIn(-1.0, 1.0) }
+                  val sx = if (bx > -R && bx < R) q(sc[by + R][bx - 1 + R], sc[by + R][bx + 1 + R]) else 0.0
+                  val sy = if (by > -R && by < R) q(sc[by - 1 + R][bx + R], sc[by + 1 + R][bx + R]) else 0.0
+                  return floatArrayOf((ox + bx + sx).toFloat(), (oy + by + sy).toFloat())
+              }
+
+              /* coarse shift on small gray images */
+              private fun est(a: ByteArray, b: ByteArray, w: Int, h: Int, R: Int, ox: Int, oy: Int, st: Int): FloatArray {
+                  val m = R + maxOf(abs(ox), abs(oy)) + 1
+                  val sc = Array(2 * R + 1) { DoubleArray(2 * R + 1) }
+                  var best = 1e18
+                  var bx = 0
+                  var by = 0
+                  for (j in -R..R) for (i in -R..R) {
+                      val dx = ox + i
+                      val dy = oy + j
+                      var s = 0.0
+                      var n = 0
+                      var y = m
+                      while (y < h - m) {
+                          var x = m
+                          while (x < w - m) {
+                              val d = (a[y * w + x].toInt() and 255) - (b[(y + dy) * w + x + dx].toInt() and 255)
+                              s += d * d; n++
+                              x += st
+                          }
+                          y += st
+                      }
+                      s /= n
+                      sc[j + R][i + R] = s
+                      if (s < best) { best = s; bx = i; by = j }
+                  }
+                  return refine(sc, R, best, bx, by, ox, oy)
+              }
+
+              /* fine sub-pixel shift on a full-resolution centre tile */
+              private fun fine(a: IntArray, b: IntArray, w: Int, h: Int, ox: Int, oy: Int): FloatArray {
+                  val R = 3
+                  val T = 300
+                  val cx = w / 2
+                  val cy = h / 2
+                  val sc = Array(2 * R + 1) { DoubleArray(2 * R + 1) }
+                  var best = 1e18
+                  var bx = 0
+                  var by = 0
+                  for (j in -R..R) for (i in -R..R) {
+                      val dx = ox + i
+                      val dy = oy + j
+                      var s = 0.0
+                      var n = 0
+                      var y = cy - T
+                      while (y < cy + T) {
+                          var x = cx - T
+                          while (x < cx + T) {
+                              val d = lum(a[y * w + x]) - lum(b[(y + dy) * w + x + dx])
+                              s += d * d; n++
+                              x += 2
+                          }
+                          y += 2
+                      }
+                      s /= n
+                      sc[j + R][i + R] = s
+                      if (s < best) { best = s; bx = i; by = j }
+                  }
+                  return refine(sc, R, best, bx, by, ox, oy)
+              }
+
+              private fun box(src: ByteArray, w: Int, h: Int, r: Int): ByteArray {
+                  val t = ByteArray(w * h)
+                  val o = ByteArray(w * h)
+                  val n = 2 * r + 1
+                  IntStream.range(0, h).parallel().forEach { y ->
+                      var s = 0
+                      val b = y * w
+                      for (i in -r..r) s += src[b + i.coerceIn(0, w - 1)].toInt() and 255
+                      for (x in 0 until w) {
+                          t[b + x] = (s / n).toByte()
+                          s += (src[b + (x + r + 1).coerceAtMost(w - 1)].toInt() and 255) - (src[b + (x - r).coerceAtLeast(0)].toInt() and 255)
+                      }
+                  }
+                  IntStream.range(0, w).parallel().forEach { x ->
+                      var s = 0
+                      for (i in -r..r) s += t[i.coerceIn(0, h - 1) * w + x].toInt() and 255
+                      for (y in 0 until h) {
+                          o[y * w + x] = (s / n).toByte()
+                          s += (t[(y + r + 1).coerceAtMost(h - 1) * w + x].toInt() and 255) - (t[(y - r).coerceAtLeast(0) * w + x].toInt() and 255)
+                      }
+                  }
+                  return o
+              }
+
+              /* luminance sharpening, shadow lift, gentle colour: classical, no AI */
+              private fun enhance(px: IntArray, w: Int, h: Int, night: Boolean) {
+                  val sa = if (night) 0.4f else 0.7f
+                  val lf = if (night) 55f else 19f
+                  val lm = ByteArray(w * h) { lum(px[it]).toByte() }
+                  val a = box(lm, w, h, 2)
+                  val b = box(lm, w, h, maxOf(6, w / 70))
+                  IntStream.range(0, h).parallel().forEach { y ->
+                      for (x in 0 until w) {
+                          val o = y * w + x
+                          val p = px[o]
+                          val l = lm[o].toInt() and 255
+                          val d = sa * (l - (a[o].toInt() and 255)) + 0.15f * (l - (b[o].toInt() and 255)) + lf * (1 - l / 255f) * (1 - l / 255f)
+                          val r = p shr 16 and 255
+                          val g = p shr 8 and 255
+                          val bl = p and 255
+                          px[o] = (0xFF shl 24) or (cl(l + (r + d - l) * 1.08f) shl 16) or (cl(l + (g + d - l) * 1.08f) shl 8) or cl(l + (bl + d - l) * 1.08f)
+                      }
+                  }
+              }
+          }
+          EOF
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk Lumen.apk
+
+          gh release create "v${{ github.run_number }}" Lumen.apk --title "Lumen build ${{ github.run_number }}" --notes "Install Lumen.apk"
